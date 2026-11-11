@@ -179,11 +179,13 @@ class PoliteSpider(Spider):
 
 When enabled, the spider will:
 
-1. **Pre-fetch robots.txt** for all domains in `start_urls` before the crawl begins (concurrently).
-2. **Check every request** against the domain's robots.txt `Disallow` rules. Disallowed requests are silently dropped and counted in `stats.robots_disallowed_count`.
-3. **Respect `Crawl-delay` and `Request-rate` directives** by taking the maximum of the directive and your configured `download_delay`. This means robots.txt delays never reduce your configured delay, only increase it when needed. When AutoThrottle is enabled, its maximum delay also caps this value. Set `autothrottle_max_delay` high enough to honor the required delay.
+1. **Pre-fetch robots.txt** for all sources in `start_urls` before the crawl begins (concurrently).
+2. **Check every request** against the source's robots.txt `Disallow` rules. Disallowed requests are silently dropped and counted in `stats.robots_disallowed_count`.
+3. **Respect `Crawl-delay` and `Request-rate` directives** by taking the maximum of the directive and your configured `download_delay`, and by pacing each group's sends: two consecutive requests of the same group go out at least `Crawl-delay` seconds apart, and a `Request-rate: R/S` directive caps the group at `R` requests in any half-open window of `S` seconds. Retried requests count against these limits; responses served from the development-mode cache don't. This means robots.txt delays never reduce your configured delay, only increase it when needed. When AutoThrottle is enabled, its maximum delay also caps this value. Set `autothrottle_max_delay` high enough to honor the required delay.
 
-Robots.txt files are fetched using the spider's default session and cached per domain for the entire crawl. Domains discovered mid-crawl (not in `start_urls`) have their robots.txt fetched on the first request to that domain.
+Robots.txt files are fetched using the spider's default session and cached per source (scheme, host, and effective port) for the entire crawl. Sources discovered mid-crawl (not in `start_urls`) have their robots.txt fetched on the first request to that source.
+
+By default, all sessions match the `User-agent: *` group. If the sites you crawl publish rules for your bot's own token, give each session its token with `robots_identity` when registering it, and its requests will follow that token's rules and pacing independently — see [Per-Session Robots.txt Identity](sessions.md#per-session-robotstxt-identity).
 
 **Note:** `robots_txt_obey` is turned off by default to avoid surprising behavior. If you enable it, it does not affect your concurrency settings (`concurrent_requests`, `concurrent_requests_per_domain`) -- only the delay between requests is adjusted.
 

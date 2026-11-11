@@ -2,8 +2,9 @@ from asyncio import Lock
 
 from scrapling.spiders.request import Request
 from scrapling.engines.static import _ASyncSessionLogic
+from scrapling.spiders.robotstxt import WILDCARD_IDENTITY
 from scrapling.engines.toolbelt.convertor import Response
-from scrapling.core._types import Set, cast, SUPPORTED_HTTP_METHODS
+from scrapling.core._types import Set, Optional, cast, SUPPORTED_HTTP_METHODS
 from scrapling.fetchers import AsyncStealthySession, FetcherSession
 
 Session = FetcherSession | AsyncStealthySession
@@ -18,14 +19,25 @@ class SessionManager:
         self._started: bool = False
         self._lazy_sessions: Set[str] = set()
         self._lazy_lock = Lock()
+        self._robots_identities: dict[str, str] = {}
 
-    def add(self, session_id: str, session: Session, *, default: bool = False, lazy: bool = False) -> "SessionManager":
+    def add(
+        self,
+        session_id: str,
+        session: Session,
+        *,
+        default: bool = False,
+        lazy: bool = False,
+        robots_identity: Optional[str] = None,
+    ) -> "SessionManager":
         """Register a session instance.
 
         :param session_id: Name to reference this session in requests
         :param session: Your pre-configured session instance
         :param default: If True, this becomes the default session
         :param lazy: If True, the session will be started only when a request uses its ID.
+        :param robots_identity: The robots.txt user-agent token this session obeys (e.g. `"MyBot"`).
+            Requests through this session follow the rules of that token's group. Defaults to `*`.
         """
         if session_id in self._sessions:
             raise ValueError(f"Session '{session_id}' already registered")
@@ -37,6 +49,9 @@ class SessionManager:
 
         if lazy:
             self._lazy_sessions.add(session_id)
+
+        if robots_identity is not None:
+            self._robots_identities[session_id] = robots_identity
 
         return self
 
@@ -59,6 +74,8 @@ class SessionManager:
         if session_id in self._lazy_sessions:
             self._lazy_sessions.remove(session_id)
 
+        self._robots_identities.pop(session_id, None)
+
         if session and self._default_session_id == session_id:
             self._default_session_id = next(iter(self._sessions), None)
 
@@ -73,6 +90,10 @@ class SessionManager:
     @property
     def session_ids(self) -> list[str]:
         return list(self._sessions.keys())
+
+    def robots_identity_for(self, session_id: str) -> str:
+        """Return the robots.txt user-agent token configured for a session, or `*` when unset."""
+        return self._robots_identities.get(session_id) or WILDCARD_IDENTITY
 
     def get(self, session_id: str) -> Session:
         if session_id not in self._sessions:

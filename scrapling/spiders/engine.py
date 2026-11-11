@@ -11,12 +11,12 @@ from scrapling.core.utils import log
 from scrapling.spiders.scheduler import Scheduler
 from scrapling.spiders.session import SessionManager
 from scrapling.spiders.request import Request, Response
-from scrapling.spiders.robotstxt import RobotsTxtManager
+from scrapling.spiders.robotstxt import RobotsTxtManager, RobotsGroupLimiter, source_key
 from scrapling.spiders.result import CrawlStats, ItemList
 from scrapling.spiders.throttle import AutoThrottle, parse_retry_after
 from scrapling.spiders.cache import ResponseCacheManager
 from scrapling.spiders.checkpoint import CheckpointManager, CheckpointData
-from scrapling.core._types import Dict, Union, Optional, TYPE_CHECKING, Any, AsyncGenerator
+from scrapling.core._types import Dict, Tuple, Callable, Awaitable, Union, Optional, TYPE_CHECKING, Any, AsyncGenerator
 
 if TYPE_CHECKING:
     from scrapling.spiders.spider import Spider
@@ -35,9 +35,14 @@ class CrawlerEngine:
         session_manager: SessionManager,
         crawldir: Optional[Union[str, Path, AsyncPath]] = None,
         interval: float = 300.0,
+        clock: Optional[Callable[[], float]] = None,
+        sleep_fn: Optional[Callable[[float], Awaitable]] = None,
     ):
         self.spider = spider
         self.session_manager = session_manager
+        # Clock/sleep used by the robots group limiters; injectable for tests
+        self._clock = clock or anyio.current_time
+        self._sleep = sleep_fn or anyio.sleep
         self.scheduler = Scheduler(
             include_kwargs=spider.fp_include_kwargs,
             include_headers=spider.fp_include_headers,
@@ -79,7 +84,8 @@ class CrawlerEngine:
         self._allowed_domains: set[str] = spider.allowed_domains or set()
 
         if self.spider.robots_txt_obey:
-            self._domain_delays: dict[str, float] = {}
+            # (scheme, host, port, identity) -> (delay floor, group limiter)
+            self._robots_rule_cache: Dict[Tuple[str, str, int, str], Tuple[float, Optional[RobotsGroupLimiter]]] = {}
 
         self._active_tasks: int = 0
         self._running: bool = False
@@ -104,37 +110,53 @@ class CrawlerEngine:
                 return True
         return False
 
-    async def _get_domain_delay(self, request: Request) -> float:
-        """Resolve the effective download delay for a domain.
+    def _robots_identity(self, request: Request) -> str:
+        """Resolve the robots identity of the session a request goes through."""
+        sid = request.sid or self.session_manager.default_session_id
+        return self.session_manager.robots_identity_for(sid)
 
-        Takes the max of the spider's configured delay and any robots.txt
-        directives (Crawl-delay / Request-rate). Result is cached per domain.
+    async def _get_robots_rules(self, request: Request) -> Tuple[float, Optional[RobotsGroupLimiter]]:
+        """Resolve the delay floor and the group limiter for a request's ``(source, identity)`` group.
+
+        The floor takes the max of the spider's configured delay and the group's
+        robots.txt directives (Crawl-delay / Request-rate), so AutoThrottle and
+        the configured delay can only slow the crawl further, never below what
+        robots.txt asks. The limiter serializes the group's sends so they honor
+        Crawl-delay spacing and the Request-rate window. Both are cached per group.
         """
         robots_manager = self._robots_manager
         if robots_manager is None:
-            return self.spider.download_delay
+            return self.spider.download_delay, None
 
-        domain = request.domain
+        identity = self._robots_identity(request)
+        key = (*source_key(request.url), identity)
 
-        if domain in self._domain_delays:
-            return self._domain_delays[domain]
+        if key in self._robots_rule_cache:
+            return self._robots_rule_cache[key]
 
-        # For domains covered by _prefetch_robots_txt this is a local parser read.
-        # Domains discovered mid-crawl (not in start_urls) will fetch here.
-        c_delay, r_rate = await robots_manager.get_delay_directives(request.url, request.sid)
+        # For sources covered by _prefetch_robots_txt this is a local parser read.
+        # Sources discovered mid-crawl (not in start_urls) will fetch here.
+        c_delay, r_rate = await robots_manager.get_delay_directives(request.url, request.sid, identity)
 
-        delay = self.spider.download_delay
+        floor = self.spider.download_delay
 
         if r_rate:
             req_count, period = r_rate
             if req_count > 0:
-                delay = max(delay, period / req_count)
+                floor = max(floor, period / req_count)
 
         if c_delay is not None:
-            delay = max(delay, c_delay)
+            floor = max(floor, c_delay)
 
-        self._domain_delays[domain] = delay
-        return delay
+        limiter = None
+        if (c_delay is not None and c_delay > 0) or (r_rate and r_rate[0] > 0):
+            limiter = RobotsGroupLimiter(
+                crawl_delay=c_delay, request_rate=r_rate, clock=self._clock, sleep_fn=self._sleep
+            )
+
+        rules = (floor, limiter)
+        self._robots_rule_cache[key] = rules
+        return rules
 
     def _rate_limiter(self, domain: str) -> CapacityLimiter:
         """Get or create a per-domain concurrency limiter if enabled, otherwise use the global limiter."""
@@ -185,13 +207,14 @@ class CrawlerEngine:
 
     async def _process_request(self, request: Request) -> None:
         """Download and process a single request."""
+        group_limiter: Optional[RobotsGroupLimiter] = None
         if self._robots_manager:
-            can_fetch = await self._robots_manager.can_fetch(request.url, request.sid)
+            can_fetch = await self._robots_manager.can_fetch(request.url, request.sid, self._robots_identity(request))
             if not can_fetch:
                 self.stats.robots_disallowed_count += 1
                 log.info(f"Request disallowed by robots.txt: {request.url}")
                 return
-            floor = await self._get_domain_delay(request)
+            floor, group_limiter = await self._get_robots_rules(request)
         else:
             floor = self.spider.download_delay
 
@@ -217,6 +240,12 @@ class CrawlerEngine:
 
             if delay:
                 await anyio.sleep(delay)
+
+            if group_limiter is not None:
+                # The group's robots.txt pacing (Crawl-delay / Request-rate) applies on
+                # top of everything else; cache hits already returned above, so only
+                # real sends (including retries) are counted here.
+                await group_limiter.acquire()
 
             if request._session_kwargs.get("proxy"):
                 self.stats.proxies.append(request._session_kwargs["proxy"])
@@ -337,7 +366,8 @@ class CrawlerEngine:
     async def _prefetch_robots_txt(self) -> None:
         """Pre-warm the robots.txt cache before the crawl loop starts.
 
-        Extracts unique domains from start_urls, preserving the original scheme.
+        Extracts unique sources from start_urls, preserving the original scheme,
+        and warms the cache for every robots identity configured on the sessions.
         """
         if not self._robots_manager or not self.spider.start_urls:
             return
@@ -351,7 +381,10 @@ class CrawlerEngine:
                 seen.add(parsed.netloc)
                 seed_urls.append(f"{parsed.scheme}://{parsed.netloc}/")
 
-        await self._robots_manager.prefetch(seed_urls, self.session_manager.default_session_id)
+        identities = tuple(
+            {self.session_manager.robots_identity_for(sid) for sid in self.session_manager.session_ids}
+        )
+        await self._robots_manager.prefetch(seed_urls, self.session_manager.default_session_id, identities)
 
     async def crawl(self) -> CrawlStats:
         """Run the spider and return CrawlStats."""
@@ -363,7 +396,7 @@ class CrawlerEngine:
         self.stats = CrawlStats(start_time=anyio.current_time())
         self._domain_limiters.clear()
         if self._robots_manager:
-            self._domain_delays.clear()
+            self._robots_rule_cache.clear()
         if self._autothrottle:
             self._autothrottle.reset()
 

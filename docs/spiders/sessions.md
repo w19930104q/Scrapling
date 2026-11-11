@@ -46,12 +46,13 @@ class MySpider(Spider):
 
 The `manager.add()` method takes:
 
-| Argument     | Type      | Default    | Description                                  |
-|--------------|-----------|------------|----------------------------------------------|
-| `session_id` | `str`     | *required* | A name to reference this session in requests |
-| `session`    | `Session` | *required* | The session instance                         |
-| `default`    | `bool`    | `False`    | Make this the default session                |
-| `lazy`       | `bool`    | `False`    | Start the session only when first used       |
+| Argument          | Type      | Default    | Description                                                            |
+|-------------------|-----------|------------|------------------------------------------------------------------------|
+| `session_id`      | `str`     | *required* | A name to reference this session in requests                           |
+| `session`         | `Session` | *required* | The session instance                                                   |
+| `default`         | `bool`    | `False`    | Make this the default session                                          |
+| `lazy`            | `bool`    | `False`    | Start the session only when first used                                 |
+| `robots_identity` | `str`     | `None`     | The robots.txt user-agent token this session obeys (defaults to `*`)   |
 
 !!! note "Notes:"
 
@@ -60,6 +61,28 @@ The `manager.add()` method takes:
         2. The session that gets `default=True` while added to the manager.
     2. The instances you pass of each session don't have to be already started by you; the spider checks on all sessions if they are not already started and starts them.
     3. If you want a specific session to start when used only, then use the `lazy` argument while adding that session to the manager. Example: start the browser only when you need it, not with the spider start.
+
+## Per-Session Robots.txt Identity
+
+When `robots_txt_obey` is enabled, every session can carry its own robots.txt user-agent token with `robots_identity`. Requests made through that session then follow the `User-agent` group matching that token — its own `Allow`/`Disallow` rules, `Crawl-delay`, and `Request-rate` — instead of the wildcard `*` group:
+
+```python
+class DualBotSpider(Spider):
+    name = "dual_bot"
+    start_urls = ["https://example.com"]
+    robots_txt_obey = True
+
+    def configure_sessions(self, manager):
+        # Obeys the rules of `User-agent: MyBot` in robots.txt
+        manager.add("main", FetcherSession(), robots_identity="MyBot")
+        # No identity configured: obeys `User-agent: *`
+        manager.add("backup", FetcherSession())
+
+    async def parse(self, response: Response):
+        yield {"title": response.css("title::text").get("")}
+```
+
+Rules are cached per source (scheme, host, and effective port — so `http://example.com` and `http://example.com:80` are the same source) **and** per identity, and each such group gets its own pacing: sends within a group are spaced by at least its `Crawl-delay`, and any half-open window of `S` seconds contains at most `R` sends when a `Request-rate: R/S` directive exists. Different sources or identities never share these limits, and they stack with `download_delay` and AutoThrottle, which can only slow the crawl further, never below what robots.txt asks.
 
 ## Multi-Session Spider
 

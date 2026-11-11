@@ -175,7 +175,7 @@ class TestFailureCaching:
         assert first is False
         assert second is False
         assert len(fetch_fn.calls) == 1
-        assert "example.com" in mgr._cache
+        assert ("https", "example.com", 443, "*") in mgr._cache
 
     @pytest.mark.asyncio
     async def test_fetch_exception_is_cached(self):
